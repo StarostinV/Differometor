@@ -375,6 +375,691 @@ def aligo(
 ### UIFO
 
 
+def _extract_parameters(parameter_array: jnp.ndarray, n: int) -> dict:
+    """
+    Extract and organize parameters from the parameter array.
+    
+    Parameters
+    ----------
+    parameter_array : jnp.ndarray
+        The flat parameter array
+    n : int
+        Grid size
+        
+    Returns
+    -------
+    dict
+        Dictionary containing organized parameter arrays
+    """
+    # Calculate dimensions
+    n_sources = n * 4
+    n_boundary_mirrors = 4 * n
+    n_cell_mirrors = 4 * n * n
+    n_mirrors = n_boundary_mirrors + n_cell_mirrors
+    n_beamsplitters = n * n
+    
+    param_idx = 0
+    
+    # Extract source parameters (power, phase) or (db, angle)
+    source_params_end = n_sources * 2
+    source_params = parameter_array[param_idx:source_params_end]
+    param_idx = source_params_end
+    
+    # Extract mirror parameters (loss, reflectivity, tuning, mass)
+    mirror_params_end = param_idx + n_mirrors * 4
+    mirror_params = parameter_array[param_idx:mirror_params_end]
+    param_idx = mirror_params_end
+    
+    # Extract beamsplitter parameters (loss, reflectivity, tuning, mass)
+    bs_params_end = param_idx + n_beamsplitters * 4
+    bs_params = parameter_array[param_idx:bs_params_end]
+    param_idx = bs_params_end
+    
+    # Extract space parameters
+    space_params = parameter_array[param_idx:]
+    space_idx = 0
+    
+    # Vertical distances between grid centers (row spacing)
+    vertical_grid_spacing = space_params[space_idx:space_idx + n - 1] if n > 1 else jnp.array([])
+    space_idx += n - 1 if n > 1 else 0
+    
+    # Horizontal distances between grid centers (column spacing)
+    horizontal_grid_spacing = space_params[space_idx:space_idx + n - 1] if n > 1 else jnp.array([])
+    space_idx += n - 1 if n > 1 else 0
+    
+    # Absolute distances from boundary elements to grid centers
+    boundary_distances = space_params[space_idx:space_idx + n * 4]
+    space_idx += n * 4
+    
+    # Relative mirror distances
+    mirror_relative_distances = space_params[space_idx:]
+    
+    return {
+        'source_params': source_params,
+        'mirror_params': mirror_params,
+        'bs_params': bs_params,
+        'vertical_grid_spacing': vertical_grid_spacing,
+        'horizontal_grid_spacing': horizontal_grid_spacing,
+        'boundary_distances': boundary_distances,
+        'mirror_relative_distances': mirror_relative_distances
+    }
+
+
+def _extract_elements(element_array: jnp.ndarray, n: int) -> dict:
+    """
+    Extract and organize elements from the element array.
+    
+    Parameters
+    ----------
+    element_array : jnp.ndarray
+        The flat element array
+    n : int
+        Grid size
+        
+    Returns
+    -------
+    dict
+        Dictionary containing organized element arrays
+    """
+    n_sources = n * 4
+    n_boundary_mirrors = 4 * n
+    n_cell_mirrors = 4 * n * n
+    n_beamsplitters = n * n
+    
+    # Separate elements into groups
+    source_elements = element_array[:n_sources]
+    boundary_mirrors = element_array[n_sources:n_sources + n_boundary_mirrors]
+    cell_mirrors = element_array[n_sources + n_boundary_mirrors:n_sources + n_boundary_mirrors + n_cell_mirrors].reshape(n, n, 4)
+    beamsplitters = element_array[n_sources + n_boundary_mirrors + n_cell_mirrors:n_sources + n_boundary_mirrors + n_cell_mirrors + n_beamsplitters].reshape(n, n)
+    
+    return {
+        'source_elements': source_elements,
+        'boundary_mirrors': boundary_mirrors,
+        'cell_mirrors': cell_mirrors,
+        'beamsplitters': beamsplitters
+    }
+
+
+def _connect_source_to_mirror(S: Setup, source_type: str, source_name: str, mirror_name: str):
+    """
+    Connect a source (laser, squeezer, or detector) to a boundary mirror.
+    
+    Parameters
+    ----------
+    S : Setup
+        The setup object
+    source_type : str
+        Type of source: "detector", "laser", or "squeezer"
+    source_name : str
+        Name of the source element
+    mirror_name : str
+        Name of the mirror element
+    """
+    if source_type == "detector":
+        # Detectors are connected directly via target parameter
+        S.add("detector", f"{source_name}detector", target=mirror_name, port="left", direction="out")
+        S.add("qnoised", f"{source_name}noise", target=mirror_name, port="left", direction="out")
+    else:
+        # Lasers and squeezers are connected via space
+        S.space(source_name, mirror_name, length=1.0, target_port="left")
+
+
+def _prepare_boundary_info(n: int) -> list[tuple[str, int, int, int, bool, int]]:
+    """
+    Prepare boundary information for the UIFO.
+    
+    Parameters
+    ----------
+    n : int
+        Grid size
+
+    Returns
+    -------
+    list[tuple[str, int, int, int, bool, int]]
+        Boundary information: (side, pos, x, y, is_row, idx_in_row_col)
+        - side: side of the boundary (top, right, bottom, left)
+        - pos: position on the boundary (0 to n-1)
+        - x: x-coordinate of the boundary
+        - y: y-coordinate of the boundary
+        - is_row: True if the boundary is a row, False if it is a column
+        - idx_in_row_col: index in the row or column
+    """
+    boundary_info = []  # Store (side, pos, x, y, is_row, idx_in_row_col)
+    
+    # Top boundary (side 0): positions (0, 1) to (0, n) - these are columns
+    for pos_idx in range(n):
+        boundary_info.append(("top", pos_idx, 0, pos_idx + 1, False, pos_idx))
+    
+    # Right boundary (side 1): positions (1, n+1) to (n, n+1) - these are rows
+    for pos_idx in range(n):
+        boundary_info.append(("right", pos_idx, pos_idx + 1, n + 1, True, pos_idx))
+    
+    # Bottom boundary (side 2): positions (n+1, n) to (n+1, 1) - these are columns (reversed)
+    for pos_idx in range(n):
+        boundary_info.append(("bottom", pos_idx, n + 1, n - pos_idx, False, n - pos_idx - 1))
+    
+    # Left boundary (side 3): positions (n, 0) to (1, 0) - these are rows (reversed)
+    for pos_idx in range(n):
+        boundary_info.append(("left", pos_idx, n - pos_idx, 0, True, n - pos_idx - 1))
+
+    return boundary_info
+
+
+def _add_source_element(S: Setup, source_element: int, source_name: str, 
+                        source_params: jnp.ndarray, param_idx: int, 
+                        element_mapping: dict) -> tuple:
+    """
+    Add a source element (laser, squeezer, or detector) to the setup.
+    
+    Parameters
+    ----------
+    S : Setup
+        The setup object
+    source_element : int
+        Element type ID
+    source_name : str
+        Name for the source
+    source_params : jnp.ndarray
+        Array of source parameters
+    param_idx : int
+        Current parameter index
+    element_mapping : dict
+        Mapping from element IDs to element types
+        
+    Returns
+    -------
+    tuple
+        (source_type, param_idx) - type of source added and updated parameter index
+    """
+    source_type = element_mapping[int(source_element)]
+    
+    if source_type == "detector":
+        # Detector has no parameters
+        return ("detector", param_idx)
+    elif source_type == "laser":
+        # Extract laser parameters (power, phase)
+        power = source_params[param_idx * 2]
+        phase = source_params[param_idx * 2 + 1]
+        S.add("laser", source_name, power=power, phase=phase)
+        return ("laser", param_idx + 1)
+    elif source_type == "squeezer":
+        # Extract squeezer parameters (db, angle)
+        db = source_params[param_idx * 2]
+        angle = source_params[param_idx * 2 + 1]
+        S.add("squeezer", source_name, db=db, angle=angle)
+        return ("squeezer", param_idx + 1)
+    
+    return (None, param_idx)
+
+
+def _add_mirror_element(S: Setup, mirror_element: int, mirror_name: str,
+                       mirror_params: jnp.ndarray, param_idx: int) -> int:
+    """
+    Add a mirror element to the setup.
+    
+    Parameters
+    ----------
+    S : Setup
+        The setup object
+    mirror_element : int
+        Element type ID (4 or 5)
+    mirror_name : str
+        Name for the mirror
+    mirror_params : jnp.ndarray
+        Array of mirror parameters
+    param_idx : int
+        Current parameter index
+        
+    Returns
+    -------
+    int
+        Updated parameter index
+    """
+    # Extract mirror parameters (loss, reflectivity, tuning, mass)
+    loss = mirror_params[param_idx * 4]
+    reflectivity = mirror_params[param_idx * 4 + 1]
+    tuning = mirror_params[param_idx * 4 + 2]
+    mass = mirror_params[param_idx * 4 + 3]
+    
+    S.add("mirror", mirror_name, loss=loss, reflectivity=reflectivity, tuning=tuning)
+    
+    # Add free mass if element type is 5
+    if int(mirror_element) == 5:
+        S.add("free_mass", f"{mirror_name}sus", mass=mass, target=mirror_name)
+    
+    return param_idx + 1
+
+
+def _add_beamsplitter_element(S: Setup, bs_element: int, bs_name: str,
+                              bs_params: jnp.ndarray, param_idx: int,
+                              element_mapping: dict, bs_orientation_mapping: dict) -> tuple:
+    """
+    Add a beamsplitter element to the setup.
+    
+    Parameters
+    ----------
+    S : Setup
+        The setup object
+    bs_element : int
+        Element type ID (6-17)
+    bs_name : str
+        Name for the beamsplitter
+    bs_params : jnp.ndarray
+        Array of beamsplitter parameters
+    param_idx : int
+        Current parameter index
+    element_mapping : dict
+        Mapping from element IDs to element types
+    bs_orientation_mapping : dict
+        Mapping from element IDs to port orientations
+        
+    Returns
+    -------
+    tuple
+        (bs_type, orientation, param_idx) - type, orientation, and updated parameter index
+    """
+    bs_type = element_mapping[bs_element]
+    orientation = bs_orientation_mapping[bs_element]
+    
+    # Extract beamsplitter parameters (loss, reflectivity, tuning, mass)
+    loss = bs_params[param_idx * 4]
+    reflectivity = bs_params[param_idx * 4 + 1]
+    tuning = bs_params[param_idx * 4 + 2]
+    mass = bs_params[param_idx * 4 + 3]
+    
+    # Add beamsplitter to setup
+    if bs_type == "beamsplitter":
+        S.add("beamsplitter", bs_name, loss=loss, reflectivity=reflectivity, tuning=tuning, alpha=45)
+    else:  # directional_beamsplitter
+        S.add("directional_beamsplitter", bs_name)
+    
+    # Add free mass if applicable
+    if bs_element in (8, 9, 14, 15, 16, 17):
+        S.add("free_mass", f"{bs_name}sus", mass=mass, target=bs_name)
+    
+    return (bs_type, orientation, param_idx + 1)
+
+
+def sparse_uifo(
+    element_array: jnp.ndarray,
+    parameter_array: jnp.ndarray,
+    size: int = 3,
+):
+    """
+    Defines a sparse quasi-universal interferometer (UIFO) based on an element array and a parameter array.
+
+    The 1D integer element array defines what elements are present in the UIFO. Here is the structure of the element array:
+    Integer to element mapping:
+
+    0: no element 
+        (0 parameters)
+    1: detector 
+        (0 parameters)
+    2: laser 
+        (2 parameters: power, phase)
+    3: squeezer 
+        (2 parameters: db, angle)
+    4: mirror 
+        (3 parameters: loss, reflectivity, tuning)
+    5: mirror with free mass 
+        (4 parameters: loss, reflectivity, tuning, mass)
+    6: beamsplitter in direction of left port
+        (3 parameters: loss, reflectivity, tuning. alpha is fixed to 45 degrees)
+    7: beamsplitter in direction of top port
+        (3 parameters: loss, reflectivity, tuning)
+    8: beamsplitter in direction of left port with free mass
+        (4 parameters: loss, reflectivity, tuning, mass)
+    9: beamsplitter in direction of top port with free mass
+        (4 parameters: loss, reflectivity, tuning, mass)
+    10: directional beamsplitter in direction of left port
+        (3 parameters: loss, reflectivity, tuning)
+    11: directional beamsplitter in direction of top port
+        (3 parameters: loss, reflectivity, tuning)
+    12: directional beamsplitter in direction of right port
+        (3 parameters: loss, reflectivity, tuning)
+    13: directional beamsplitter in direction of bottom port
+        (3 parameters: loss, reflectivity, tuning)
+    14: directional beamsplitter in direction of left port with free mass
+        (4 parameters: loss, reflectivity, tuning, mass)
+    15: directional beamsplitter in direction of top port with free mass
+        (4 parameters: loss, reflectivity, tuning, mass)
+    16: directional beamsplitter in direction of right port with free mass
+        (4 parameters: loss, reflectivity, tuning, mass)
+    17: directional beamsplitter in direction of bottom port with free mass
+        (4 parameters: loss, reflectivity, tuning, mass)
+
+    The max number of elements where n is the size of the UIFO:
+    - 1 detector (necessary for the scheme to work; so far we don't support balanced homodyne detection)
+    - n * 4 - 1 lasers (-1 because of the detector)
+    - n * 4 - 1 squeezers
+    - n * 4 + 4 * n * n mirrors (n * 4 for the boundaries and 4 * n * n for the centers)
+    - n * n - beamsplitters / directional beamsplitters
+
+    0:n*4 - boundary sources (N_sources=n*4);
+        elements: (0: nothing, 1: detector, 2: laser, 3: squeezer)
+        order: clockwise starting from top left.
+    n*4:8*n - boundary mirrors (N_boundary_mirrors=n*4); 
+        elements: (0: nothing, 4: mirror, 5: mirror with free mass)
+        order: clockwise starting from top left.
+    8*n:8*n + 4*n*n - cell mirrors (N_cell_mirrors=4*n*n);
+        elements: (0: nothing, 4: mirror, 5: mirror with free mass)
+        order: cell first (clockwise starting from top left), then rows (from left to right), then columns (from top to bottom).
+    8*n + 4*n*n:8*n + 5*n*n - cell beamsplitters / directional beamsplitters (N_cell_beamsplitters=n*n);
+        elements: (0: nothing, 6-17: beamsplitters)
+        order: cell first (clockwise starting from top left), then rows (from left to right), then columns (from top to bottom).
+
+    Total number of element positions: N_elements = N_sources + N_boundary_mirrors + N_cell_mirrors + N_cell_beamsplitters = n*4 + 4*n + 4*n*n + n*n = n * (8 + 5*n).
+        N_elements(n=3) = 69; N_elements(n=4) = 112; N_elements(n=5) = 165.
+
+    To resolve invariances in the setup, we allow the detector to be placed only at the one of top left [(n + 1) / 2] boundary positions.
+
+    The spaces are defined in the following way:
+
+    - n - 1 absolute vertical distances between the grid centers
+    - n - 1 absolute horizontal distances between the grid centers
+    - n * 4 absolute distances between the boundary element and the closest grid center
+    - n * 4 + 4 * n * n relative mirror distances to the closest grid center \in [0, 1]
+
+    N_spaces = 10 * n + 4 * n * n - 2.
+    N_spaces(n=3) = 64; N_spaces(n=4) = 102; N_spaces(n=5) = 148; 
+
+    Parameter array:
+
+    [N_sources * 2, N_mirrors * 4, N_beamsplitters * 4, N_spaces].
+
+    Total number of parameters: 
+    N_parameters = N_sources * 2 + N_mirrors * 4 + N_beamsplitters * 4 + N_spaces = n * 34 + n * n * 24 - 2
+    N_parameters(n=3) = 318; N_parameters(n=4) = 518; N_parameters(n=5) = 768.
+
+
+    Parameters
+    ----------
+    element_array: jnp.ndarray
+        The element array. Shape: (N_elements,).
+    parameter_array: jnp.ndarray 
+        The parameter array. Shape: (N_parameters,).
+    size: int
+        The size of the grid. E.g. 3 results in a 3x3 grid.
+    """
+
+    # calculate the number of elements and parameters
+    n = size
+    n_elements = n * (8 + 5*n)
+    n_sources = n * 4
+    n_boundary_mirrors = 4 * n
+    n_cell_mirrors = 4 * n * n
+    n_mirrors = n_boundary_mirrors + n_cell_mirrors
+    n_beamsplitters = n * n
+    n_spaces = 10 * n + 4 * n * n - 2
+
+    n_parameters = n_sources * 2 + n_mirrors * 4 + n_beamsplitters * 4 + n_spaces
+
+    # Validate dimensions
+    if element_array.shape != (n_elements,):
+        raise ValueError(f"Element array must have shape ({n_elements},).")
+    if parameter_array.shape != (n_parameters,):
+        raise ValueError(f"Parameter array must have shape ({n_parameters},).")
+
+    # Element type mapping
+    element_mapping = {
+        0: None,
+        1: "detector",
+        2: "laser",
+        3: "squeezer",
+        4: "mirror",
+        5: "mirror",  # with free mass
+        6: "beamsplitter",  # left port
+        7: "beamsplitter",  # top port
+        8: "beamsplitter",  # left port with free mass
+        9: "beamsplitter",  # top port with free mass
+        10: "directional_beamsplitter",  # left port
+        11: "directional_beamsplitter",  # top port
+        12: "directional_beamsplitter",  # right port
+        13: "directional_beamsplitter",  # bottom port
+        14: "directional_beamsplitter",  # left port with free mass
+        15: "directional_beamsplitter",  # top port with free mass
+        16: "directional_beamsplitter",  # right port with free mass
+        17: "directional_beamsplitter",  # bottom port with free mass
+    }
+
+    # Beamsplitter orientation mapping
+    bs_orientation_mapping = {
+        6: "left", 7: "top", 8: "left", 9: "top",
+        10: "left", 11: "top", 12: "right", 13: "bottom",
+        14: "left", 15: "top", 16: "right", 17: "bottom"
+    }
+
+    # Extract elements and parameters using helper functions
+    elements = _extract_elements(element_array, n)
+    params = _extract_parameters(parameter_array, n)
+    
+    # Calculate absolute grid center positions
+    row_positions = jnp.zeros(n)
+    if n > 1:
+        row_positions = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(params['vertical_grid_spacing'])])
+    
+    col_positions = jnp.zeros(n)
+    if n > 1:
+        col_positions = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(params['horizontal_grid_spacing'])])
+    
+    # Initialize rows and cols to store elements with their positions
+    # Each element in row/col is a tuple: (name, port_in, port_out, position)
+    rows = [[] for _ in range(n)]
+    cols = [[] for _ in range(n)]
+
+    # Create the Setup object
+    S = Setup()
+    
+    # Add frequency component (required for signal generation)
+    S.add("frequency", "f")
+    
+    # Track parameter indices
+    source_param_idx = 0
+    mirror_param_idx = 0
+    bs_param_idx = 0
+    mirror_dist_idx = 0
+    
+    # Add boundary sources and mirrors
+    # Boundary ordering: clockwise from top-left
+    # For n=3: top row (0,1), (0,2), (0,3), right col (1,3), (2,3), (3,3), 
+    #          bottom row (3,2), (3,1), (3,0), left col (2,0), (1,0), (0,0)
+    # But we use simpler indexing: side index 0-3 (top, right, bottom, left), position 0 to n-1
+    
+    boundary_info = _prepare_boundary_info(n) # [(side, pos, x, y, is_row, idx_in_row_col)]
+        
+    # Dictionary to track which boundary positions have sources
+    boundary_sources = {}
+    
+    # Process boundary sources
+    for boundary_idx, (side, pos_idx, x, y, is_row, idx_in_row_col) in enumerate(boundary_info):
+        source_element = elements['source_elements'][boundary_idx]
+        
+        if source_element == 0:  # No element
+            continue
+        
+        # Add source element using helper function
+        source_name = f"boundary{x}{y}"
+        source_type, source_param_idx = _add_source_element(
+            S, source_element, source_name, 
+            params['source_params'], source_param_idx, 
+            element_mapping
+        )
+        
+        if source_type:
+            boundary_sources[boundary_idx] = (source_type, source_name)
+    
+    # Process boundary mirrors
+    for boundary_idx, (side, pos_idx, x, y, is_row, idx_in_row_col) in enumerate(boundary_info):
+        mirror_element = elements['boundary_mirrors'][boundary_idx]
+        
+        if mirror_element == 0:  # No mirror
+            continue
+        
+        # Add boundary mirror using helper function
+        mirror_name = f"m{x}{y}"
+        mirror_param_idx = _add_mirror_element(
+            S, mirror_element, mirror_name, 
+            params['mirror_params'], mirror_param_idx
+        )
+        
+        # Calculate mirror position relative to grid center
+        boundary_dist = params['boundary_distances'][boundary_idx]
+        mirror_rel_dist = params['mirror_relative_distances'][mirror_dist_idx]
+        mirror_dist_idx += 1
+        
+        # Check if there's a source at this boundary position
+        source_info = boundary_sources.get(boundary_idx, None)
+        
+        # Connect source to mirror if present
+        if source_info:
+            source_type, source_name = source_info
+            _connect_source_to_mirror(S, source_type, source_name, mirror_name)
+        
+        # Position calculation and adding to rows/cols depends on which side
+        if side == "top":
+            # Column idx_in_row_col, positioned above the grid
+            grid_center_row = row_positions[0]
+            mirror_position = grid_center_row - boundary_dist - mirror_rel_dist
+            # Add mirror to column (mirrors face the grid center with their right port)
+            cols[idx_in_row_col].append((mirror_name, "right", "left", mirror_position))
+            
+        elif side == "bottom":
+            # Column idx_in_row_col, positioned below the grid
+            grid_center_row = row_positions[n - 1]
+            mirror_position = grid_center_row + boundary_dist + mirror_rel_dist
+            # Add mirror to column
+            cols[idx_in_row_col].append((mirror_name, "right", "left", mirror_position))
+            
+        elif side == "left":
+            # Row idx_in_row_col, positioned left of the grid
+            grid_center_col = col_positions[0]
+            mirror_position = grid_center_col - boundary_dist - mirror_rel_dist
+            # Add mirror to row (mirrors face the grid center with their right port)
+            rows[idx_in_row_col].append((mirror_name, "right", "left", mirror_position))
+            
+        elif side == "right":
+            # Row idx_in_row_col, positioned right of the grid
+            grid_center_col = col_positions[n - 1]
+            mirror_position = grid_center_col + boundary_dist + mirror_rel_dist
+            # Add mirror to row
+            rows[idx_in_row_col].append((mirror_name, "right", "left", mirror_position))
+    
+    # Process cell beamsplitters and mirrors
+    for row_idx in range(n):
+        for col_idx in range(n):
+            # Get beamsplitter element
+            bs_element = int(elements['beamsplitters'][row_idx, col_idx])
+            
+            if bs_element == 0:  # No beamsplitter
+                continue
+            
+            # Add beamsplitter using helper function
+            bs_name = f"center{row_idx + 1}{col_idx + 1}"
+            bs_type, orientation, bs_param_idx = _add_beamsplitter_element(
+                S, bs_element, bs_name,
+                params['bs_params'], bs_param_idx,
+                element_mapping, bs_orientation_mapping
+            )
+            
+            # Get grid center position
+            grid_row_pos = row_positions[row_idx]
+            grid_col_pos = col_positions[col_idx]
+            
+            # Add beamsplitter to both row and col
+            # The ports depend on orientation
+            if orientation == "left":
+                rows[row_idx].append((bs_name, "left", "right", grid_col_pos))
+                cols[col_idx].append((bs_name, "bottom", "top", grid_row_pos))
+            elif orientation == "top":
+                rows[row_idx].append((bs_name, "top", "bottom", grid_col_pos))
+                cols[col_idx].append((bs_name, "left", "right", grid_row_pos))
+            elif orientation == "right":
+                rows[row_idx].append((bs_name, "right", "left", grid_col_pos))
+                cols[col_idx].append((bs_name, "top", "bottom", grid_row_pos))
+            elif orientation == "bottom":
+                rows[row_idx].append((bs_name, "bottom", "top", grid_col_pos))
+                cols[col_idx].append((bs_name, "right", "left", grid_row_pos))
+            
+            # Process cell mirrors (4 mirrors per cell: left, top, right, bottom)
+            mirror_names = [f"ml{row_idx + 1}{col_idx + 1}", f"mt{row_idx + 1}{col_idx + 1}", 
+                          f"mr{row_idx + 1}{col_idx + 1}", f"mb{row_idx + 1}{col_idx + 1}"]
+            
+            for mirror_idx, mirror_local_name in enumerate(mirror_names):
+                cell_mirror_element = int(elements['cell_mirrors'][row_idx, col_idx, mirror_idx])
+                
+                if cell_mirror_element == 0:  # No mirror
+                    continue
+                
+                # Add cell mirror using helper function
+                mirror_param_idx = _add_mirror_element(
+                    S, cell_mirror_element, mirror_local_name,
+                    params['mirror_params'], mirror_param_idx
+                )
+                
+                # Calculate mirror position and add to row or col
+                mirror_rel_dist = params['mirror_relative_distances'][mirror_dist_idx]
+                mirror_dist_idx += 1
+                
+                # Mirror 0 (left), Mirror 2 (right) go in rows
+                # Mirror 1 (top), Mirror 3 (bottom) go in columns
+                if mirror_idx == 0:  # Left mirror
+                    mirror_position = grid_col_pos - mirror_rel_dist
+                    rows[row_idx].append((mirror_local_name, "right", "left", mirror_position))
+                elif mirror_idx == 1:  # Top mirror
+                    mirror_position = grid_row_pos - mirror_rel_dist
+                    cols[col_idx].append((mirror_local_name, "right", "left", mirror_position))
+                elif mirror_idx == 2:  # Right mirror
+                    mirror_position = grid_col_pos + mirror_rel_dist
+                    rows[row_idx].append((mirror_local_name, "right", "left", mirror_position))
+                elif mirror_idx == 3:  # Bottom mirror
+                    mirror_position = grid_row_pos + mirror_rel_dist
+                    cols[col_idx].append((mirror_local_name, "right", "left", mirror_position))
+    
+    # Now connect elements within each row and column
+    # Sort elements by position and connect them with spaces
+    
+    for row_idx, row in enumerate(rows):
+        if len(row) < 2:
+            continue
+        
+        # Sort by position
+        row_sorted = sorted(row, key=lambda x: x[3])
+        
+        # Connect adjacent elements
+        for i in range(len(row_sorted) - 1):
+            src_name, src_port_in, src_port_out, src_pos = row_sorted[i]
+            tgt_name, tgt_port_in, tgt_port_out, tgt_pos = row_sorted[i + 1]
+            
+            # Calculate space length
+            length = abs(tgt_pos - src_pos)
+            
+            # Add space
+            S.space(src_name, tgt_name, length=length, 
+                   source_port=src_port_out, target_port=tgt_port_in)
+    
+    for col_idx, col in enumerate(cols):
+        if len(col) < 2:
+            continue
+        
+        # Sort by position
+        col_sorted = sorted(col, key=lambda x: x[3])
+        
+        # Connect adjacent elements
+        for i in range(len(col_sorted) - 1):
+            src_name, src_port_in, src_port_out, src_pos = col_sorted[i]
+            tgt_name, tgt_port_in, tgt_port_out, tgt_pos = col_sorted[i + 1]
+            
+            # Calculate space length
+            length = abs(tgt_pos - src_pos)
+            
+            # Add space
+            S.space(src_name, tgt_name, length=length,
+                   source_port=src_port_out, target_port=tgt_port_in)
+    
+    # Return the setup and parameters
+    return S, S.parameters
+
+
 def uifo(
         size: int, 
         centers: dict = None, 
