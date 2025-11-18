@@ -3,7 +3,200 @@ import jax.numpy as jnp
 from functools import partial
 
 
-def get_length_function(src_name: str, tgt_name: str, n: int):
+def get_active_parameters_mask(element_array: jnp.ndarray, sparse_setup: dict, n: int) -> jnp.ndarray:
+    """
+    Generate a mask of active parameters for a given element array and sparse setup.
+
+    The parameter order is as follows:
+    - boundary source parameters (2 parameters per source x n x 4 in total; clockwise starting from top left)
+    For detector, the parameters are ignored. For laser, the parameters are the power and phase. For squeezer, the parameters are the db and angle.
+    - boundary mirror parameters (4 parameters per mirror x n x 4 in total; clockwise starting from top left)
+    For mirror, the parameters are the loss, reflectivity, tuning, and mass.
+    - cell mirror parameters (4 parameters per mirror x n x n x 4 in total; cell first (clockwise starting from left), then rows (from left to right), then columns (from top to bottom))
+    For mirror, the parameters are the loss, reflectivity, tuning, and mass.
+    - cell beamsplitter parameters (5 parameters per beamsplitter x n x n in total; cell first (clockwise starting from top left), then rows (from left to right), then columns (from top to bottom))
+    For beamsplitter, the parameters are the loss, reflectivity, tuning, alpha, and mass.
+    For directional beamsplitter, the parameters are ignored completely.
+
+    The physical parameters are followed by the positional encoding parameters:
+    - n*4 boundary source distances (clockwise starting from top left)
+    - (n-1) row spacing distances (distances between consecutive rows)
+    - (n-1) col spacing distances (distances between consecutive columns)
+    - n*4 boundary mirror relative distances (clockwise starting from top left)
+    - n*n*4 cell mirror relative distances (top-right-bottom-left, then by row, then by col)
+
+    Therefore, the total number of parameters is:
+    N_parameters = 25 * n ** 2 + 34 * n - 2.
+
+    Parameters
+    ----------
+    element_array : jnp.ndarray
+        The element array. Shape: (N_elements,) where N_elements = n * (8 + 5*n).
+    sparse_setup : dict
+        The sparse setup.
+    n : int
+        Grid size (n x n grid)
+
+    Returns
+    -------
+    jnp.ndarray
+        The boolean mask of active parameters. Shape: (N_parameters,)
+    """
+
+    # We don't need this function to be too efficient since it is only used once per setup.
+    # So we use a simple and readable implementation.
+
+    # Total parameter count calculation:
+    # Physical: 8n (boundary sources) + 16n (boundary mirrors) + 16n² (cell mirrors) + 5n² (cell beamsplitters)
+    # Positional: 4n (boundary source distances) + (n-1) (row spacing) + (n-1) (col spacing) + 4n (boundary mirror rel) + 4n² (cell mirror rel)
+    # Total: 21n² + 8n + 16n + 4n + 2(n-1) = 21n² + 28n + 2n - 2 = ... wait, let me recalculate
+    # Physical: 2*4n + 4*4n + 4*4n² + 5n² = 8n + 16n + 16n² + 5n² = 21n² + 24n
+    # Positional: 4n + (n-1) + (n-1) + 4n + 4n² = 8n + 2n - 2 + 4n² = 4n² + 10n - 2
+    # Total: 21n² + 24n + 4n² + 10n - 2 = 25n² + 34n - 2 ✓
+    N_parameters = 25 * n ** 2 + 34 * n - 2
+    
+    # Initialize all parameters as inactive
+    mask = jnp.zeros(N_parameters, dtype=bool)
+    
+    # Extract element subsets from the flat element_array
+    # Array structure: [boundary_sources(4n), boundary_mirrors(4n), cell_mirrors(4n²), cell_beamsplitters(n²)]
+    n_boundary_sources = 4 * n
+    n_boundary_mirrors = 4 * n
+    n_cell_mirrors = 4 * n * n
+    n_cell_beamsplitters = n * n
+    
+    # Split the element array into sections
+    boundary_sources = element_array[:n_boundary_sources]
+    boundary_mirrors = element_array[n_boundary_sources:n_boundary_sources + n_boundary_mirrors]
+    cell_mirrors = element_array[n_boundary_sources + n_boundary_mirrors:n_boundary_sources + n_boundary_mirrors + n_cell_mirrors]
+    cell_beamsplitters = element_array[n_boundary_sources + n_boundary_mirrors + n_cell_mirrors:]
+    
+    # Track the current position in the parameter array
+    param_idx = 0
+    
+    # ===== PHYSICAL PARAMETERS =====
+    
+    # 1. BOUNDARY SOURCE PARAMETERS (2 params per source × 4n sources = 8n params)
+    # Detector (1): no parameters
+    # Laser (2): power, phase
+    # Squeezer (3): db, angle
+    for i in range(n_boundary_sources):
+        element_type = boundary_sources[i]
+        
+        # Check if this is a laser or squeezer (both have 2 parameters)
+        is_laser = (element_type == 2)
+        is_squeezer = (element_type == 3)
+        
+        if is_laser or is_squeezer:
+            # Activate both parameters for laser/squeezer
+            mask = mask.at[param_idx:param_idx + 2].set(True)
+        
+        # Move to next source's parameter slots (2 params per source)
+        param_idx += 2
+    
+    # 2. BOUNDARY MIRROR PARAMETERS (4 params per mirror × 4n mirrors = 16n params)
+    # Element types: 0 (nothing), 4 (mirror), 5 (mirror with free mass)
+    # Parameters: loss, reflectivity, tuning, mass
+    for i in range(n_boundary_mirrors):
+        element_type = boundary_mirrors[i]
+        
+        # Check if this is a mirror (with or without free mass)
+        is_mirror = (element_type == 4)
+        is_mirror_with_mass = (element_type == 5)
+        
+        if is_mirror:
+            # Activate first 3 parameters (loss, reflectivity, tuning), but not mass
+            mask = mask.at[param_idx:param_idx + 3].set(True)
+        elif is_mirror_with_mass:
+            # Activate all 4 parameters (loss, reflectivity, tuning, mass)
+            mask = mask.at[param_idx:param_idx + 4].set(True)
+        
+        # Move to next mirror's parameter slots (4 params per mirror)
+        param_idx += 4
+    
+    # 3. CELL MIRROR PARAMETERS (4 params per mirror × 4n² mirrors = 16n² params)
+    # Same structure as boundary mirrors
+    # Order: cell first (clockwise: left, top, right, bottom), then by row (left to right), then by col (top to bottom)
+    for i in range(n_cell_mirrors):
+        element_type = cell_mirrors[i]
+        
+        is_mirror = (element_type == 4)
+        is_mirror_with_mass = (element_type == 5)
+        
+        if is_mirror:
+            # Activate first 3 parameters (loss, reflectivity, tuning)
+            mask = mask.at[param_idx:param_idx + 3].set(True)
+        elif is_mirror_with_mass:
+            # Activate all 4 parameters (loss, reflectivity, tuning, mass)
+            mask = mask.at[param_idx:param_idx + 4].set(True)
+        
+        # Move to next mirror's parameter slots (4 params per mirror)
+        param_idx += 4
+    
+    # 4. CELL BEAMSPLITTER PARAMETERS (5 params per beamsplitter × n² beamsplitters = 5n² params)
+    # Beamsplitter types: 6-9 (regular beamsplitter, possibly with mass)
+    # Directional beamsplitter types: 10-17 (no parameters)
+    # Parameters: loss, reflectivity, tuning, alpha, mass
+    for i in range(n_cell_beamsplitters):
+        element_type = cell_beamsplitters[i]
+        
+        # Regular beamsplitters: 6-7 (without mass), 8-9 (with mass)
+        is_beamsplitter_no_mass = (element_type == 6) | (element_type == 7)
+        is_beamsplitter_with_mass = (element_type == 8) | (element_type == 9)
+        
+        if is_beamsplitter_no_mass:
+            # Activate first 4 parameters (loss, reflectivity, tuning, alpha), but not mass
+            mask = mask.at[param_idx:param_idx + 4].set(True)
+        elif is_beamsplitter_with_mass:
+            # Activate all 5 parameters (loss, reflectivity, tuning, alpha, mass)
+            mask = mask.at[param_idx:param_idx + 5].set(True)
+        # Directional beamsplitters (10-17): no parameters are active
+        
+        # Move to next beamsplitter's parameter slots (5 params per beamsplitter)
+        param_idx += 5
+    
+    # ===== POSITIONAL ENCODING PARAMETERS =====
+    # So far all are active (TODO: will change in the future)
+    
+    # 5. BOUNDARY SOURCE DISTANCES (4n params)
+    # Clockwise from top left: top, right, bottom, left
+    mask = mask.at[param_idx:param_idx + 4 * n].set(True)
+    param_idx += 4 * n
+    
+    # 6. ROW SPACING DISTANCES ((n-1) params)
+    # Distances between consecutive rows
+    mask = mask.at[param_idx:param_idx + (n - 1)].set(True)
+    param_idx += (n - 1)
+    
+    # 7. COLUMN SPACING DISTANCES ((n-1) params)
+    # Distances between consecutive columns
+    mask = mask.at[param_idx:param_idx + (n - 1)].set(True)
+    param_idx += (n - 1)
+    
+    # 8. BOUNDARY MIRROR RELATIVE DISTANCES (4n params)
+    # Clockwise from top left
+    mask = mask.at[param_idx:param_idx + 4 * n].set(True)
+    param_idx += 4 * n
+    
+    # 9. CELL MIRROR RELATIVE DISTANCES (4n² params)
+    # Order: top, right, bottom, left for each cell, then by row, then by col
+    mask = mask.at[param_idx:param_idx + 4 * n * n].set(True)
+    param_idx += 4 * n * n
+    
+    # Sanity check: ensure we've processed all parameters
+    assert param_idx == N_parameters, f"Parameter count mismatch: expected {N_parameters}, got {param_idx}"
+    
+    return mask
+
+
+def get_sparse_parameter_bounds(element_array: jnp.ndarray, sparse_setup: dict, n: int):
+    """
+    Generate the bounds of the sparse parameters for a given element array and sparse setup.
+    """
+    pass
+
+
+def get_length_function(connection_name: str, n: int):
     """
     Generate a function that calculates the length of a connection between two elements.
     Assumes naming convention from (sparse) uifo setup, i.e. '{name}{x}{y}', 
@@ -11,10 +204,9 @@ def get_length_function(src_name: str, tgt_name: str, n: int):
     
     Parameters
     ----------
-    src_name : str
-        Name of the source element.
-    tgt_name : str
-        Name of the target element
+    connection_name : str
+        Name of the connection, e.g. 'm11_m12' for a connection between mirror 11 and mirror 12. 
+        As a convention, the source element is the one before the underscore and the target element is the one after the underscore.
     n : int
         Grid size (n x n grid)
 
@@ -23,6 +215,7 @@ def get_length_function(src_name: str, tgt_name: str, n: int):
     function
         Function that calculates the length of a connection between two elements given a distance array.
     """
+    src_name, tgt_name = connection_name.split("_")
     x1, y1, mirror_type_src = _element_name_to_numbers(src_name)
     x2, y2, mirror_type_tgt = _element_name_to_numbers(tgt_name)
     return _get_length_from_distance_array_fn(x1, x2, y1, y2, mirror_type_src, mirror_type_tgt, n)
