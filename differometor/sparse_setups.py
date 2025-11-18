@@ -1,7 +1,5 @@
 import jax.numpy as jnp
 from differometor.setups import Setup
-from differometor.components import DEFAULT_PROPERTIES
-
 
 
 def sparse_uifo(
@@ -51,7 +49,7 @@ def sparse_uifo(
         order: clockwise starting from top left.
     8*n:8*n + 4*n*n - cell mirrors (N_cell_mirrors=4*n*n);
         elements: (0: nothing, 4: mirror, 5: mirror with free mass)
-        order: cell first (clockwise starting from top left), then rows (from left to right), then columns (from top to bottom).
+        order: cell first (clockwise starting from left), then rows (from left to right), then columns (from top to bottom).
     8*n + 4*n*n:8*n + 5*n*n - cell beamsplitters / directional beamsplitters (N_cell_beamsplitters=n*n);
         elements: (0: nothing, 6-17: beamsplitters)
         order: cell first (clockwise starting from top left), then rows (from left to right), then columns (from top to bottom).
@@ -121,12 +119,15 @@ def sparse_uifo(
     # Use default spacing for grid
     default_spacing = 1.0
     
-    # Calculate absolute grid center positions with uniform spacing
-    row_positions = jnp.arange(n, dtype=float) * default_spacing
-    col_positions = jnp.arange(n, dtype=float) * default_spacing
-    
+    # Some default positions to arrange elements in rows and columns 
+    # Then the elements are sorted by position and connected with the spaces.
+    # The order is top to bottom for rows and left to right for columns.
+    row_positions = jnp.arange(n + 2, dtype=float) * default_spacing
+    col_positions = jnp.arange(n + 2, dtype=float) * default_spacing
+    mirror_relative_dist = 0.25 
+
     # Initialize rows and cols to store elements with their positions
-    # Each element in row/col is a tuple: (name, port_in, port_out, position)
+    # Each element in row/col is a tuple: (name, port_in, port_out, position, element_type)
     rows = [[] for _ in range(n)]
     cols = [[] for _ in range(n)]
 
@@ -135,24 +136,12 @@ def sparse_uifo(
     
     # Add frequency component (required for signal generation)
     S.add("frequency", "f")
-    
-    # Default values for spaces and mirrors
-    default_boundary_distance = 1.0
-    default_mirror_relative_distance = 0.5  # Middle point between grid center and boundary
-    
-    # Add boundary sources and mirrors
-    # Boundary ordering: clockwise from top-left
-    # For n=3: top row (0,1), (0,2), (0,3), right col (1,3), (2,3), (3,3), 
-    #          bottom row (3,2), (3,1), (3,0), left col (2,0), (1,0), (0,0)
-    # But we use simpler indexing: side index 0-3 (top, right, bottom, left), position 0 to n-1
-    
-    boundary_info = _prepare_boundary_info(n) # [(side, pos, x, y, is_row, idx_in_row_col)]
         
-    # Dictionary to track which boundary positions have sources
-    boundary_sources = {}
-    
+    # Info on encoding boundary elements
+    boundary_info = _prepare_boundary_info(n) # [(side, row_or_col, x, y, idx_in_row_col)]
+            
     # Process boundary sources
-    for boundary_idx, (side, pos_idx, x, y, is_row, idx_in_row_col) in enumerate(boundary_info):
+    for boundary_idx, (side, row_or_col, x, y, idx_in_row_col) in enumerate(boundary_info):
         source_element = elements['source_elements'][boundary_idx]
         
         if source_element == 0:  # No element
@@ -160,72 +149,45 @@ def sparse_uifo(
         
         # Add source element using helper function with default parameters
         source_name = f"boundary{x}{y}"
-        source_type = _add_source_element_default(
-            S, source_element, source_name, element_mapping
-        )
+        source_type = element_mapping[int(source_element)]
+        assert source_type in ["detector", "laser", "squeezer"]
+
+        # We will add the source element to the setup later once we have sorted the elements by position
+        # and know the target port.
+
+        if row_or_col == "row":
+            rows[idx_in_row_col].append((source_name, "left", "right", row_positions[y], source_type))
+        else:
+            cols[idx_in_row_col].append((source_name, "left", "right", col_positions[x], source_type))
         
-        if source_type:
-            boundary_sources[boundary_idx] = (source_type, source_name)
-            
-            # Add amplitude or frequency modulation signals for lasers
-            if source_type == "laser":
-                if mode == "amplitude_modulation":
-                    S.add("signal", f"s{source_name}", target=f"{source_name}_amplitude", 
-                          amplitude=(f"{source_name}_power", jnp.sqrt))
-                elif mode == "frequency_modulation":
-                    S.add("signal", f"s{source_name}", target=f"{source_name}_frequency")
-    
     # Process boundary mirrors
-    for boundary_idx, (side, pos_idx, x, y, is_row, idx_in_row_col) in enumerate(boundary_info):
+    for boundary_idx, (side, row_or_col, x, y, idx_in_row_col) in enumerate(boundary_info):
         mirror_element = elements['boundary_mirrors'][boundary_idx]
         
         if mirror_element == 0:  # No mirror
             continue
         
-        # Add boundary mirror using helper function with default parameters
         mirror_name = f"m{x}{y}"
-        _add_mirror_element_default(S, mirror_element, mirror_name)
-        
-        # Calculate mirror position using default distances
-        boundary_dist = default_boundary_distance
-        mirror_rel_dist = default_mirror_relative_distance
-        
-        # Check if there's a source at this boundary position
-        source_info = boundary_sources.get(boundary_idx, None)
-        
-        # Connect source to mirror if present
-        if source_info:
-            source_type, source_name = source_info
-            _connect_source_to_mirror(S, source_type, source_name, mirror_name)
-        
+
+        # Add mirror to the setup (potentially with free mass)
+        _add_mirror(S, mirror_element, mirror_name)
+                                
         # Position calculation and adding to rows/cols depends on which side
         if side == "top":
-            # Column idx_in_row_col, positioned above the grid
-            grid_center_row = row_positions[0]
-            mirror_position = grid_center_row - boundary_dist - mirror_rel_dist
-            # Add mirror to column (mirrors face the grid center with their right port)
-            cols[idx_in_row_col].append((mirror_name, "right", "left", mirror_position))
+            mirror_position = mirror_relative_dist
+            cols[idx_in_row_col].append((mirror_name, "left", "right", mirror_position, "mirror"))
             
         elif side == "bottom":
-            # Column idx_in_row_col, positioned below the grid
-            grid_center_row = row_positions[n - 1]
-            mirror_position = grid_center_row + boundary_dist + mirror_rel_dist
-            # Add mirror to column
-            cols[idx_in_row_col].append((mirror_name, "right", "left", mirror_position))
+            mirror_position = col_positions[n + 1] - mirror_relative_dist
+            cols[idx_in_row_col].append((mirror_name, "left", "right", mirror_position, "mirror"))
             
         elif side == "left":
-            # Row idx_in_row_col, positioned left of the grid
-            grid_center_col = col_positions[0]
-            mirror_position = grid_center_col - boundary_dist - mirror_rel_dist
-            # Add mirror to row (mirrors face the grid center with their right port)
-            rows[idx_in_row_col].append((mirror_name, "right", "left", mirror_position))
+            mirror_position = mirror_relative_dist
+            rows[idx_in_row_col].append((mirror_name, "left", "right", mirror_position, "mirror"))
             
         elif side == "right":
-            # Row idx_in_row_col, positioned right of the grid
-            grid_center_col = col_positions[n - 1]
-            mirror_position = grid_center_col + boundary_dist + mirror_rel_dist
-            # Add mirror to row
-            rows[idx_in_row_col].append((mirror_name, "right", "left", mirror_position))
+            mirror_position = col_positions[n + 1] - mirror_relative_dist
+            rows[idx_in_row_col].append((mirror_name, "left", "right", mirror_position, "mirror"))
     
     # Process cell beamsplitters and mirrors
     for row_idx in range(n):
@@ -233,14 +195,14 @@ def sparse_uifo(
             # Get beamsplitter element
             bs_element = int(elements['beamsplitters'][row_idx, col_idx])
              # Get grid center position
-            grid_row_pos = row_positions[row_idx]
-            grid_col_pos = col_positions[col_idx]
+            grid_row_pos = row_positions[row_idx + 1]
+            grid_col_pos = col_positions[col_idx + 1]
             
             if bs_element != 0:  # No beamsplitter
             
                 # Add beamsplitter using helper function with default parameters
                 bs_name = f"center{row_idx + 1}{col_idx + 1}"
-                bs_type, orientation = _add_beamsplitter_element_default(
+                bs_type, orientation = _add_beamsplitter_element(
                     S, bs_element, bs_name,
                     element_mapping, bs_orientation_mapping
                 )
@@ -248,17 +210,17 @@ def sparse_uifo(
                 # Add beamsplitter to both row and col
                 # The ports depend on orientation
                 if orientation == "left":
-                    rows[row_idx].append((bs_name, "left", "right", grid_col_pos))
-                    cols[col_idx].append((bs_name, "top", "bottom", grid_row_pos))
+                    rows[row_idx].append((bs_name, "left", "right", grid_col_pos, "beamsplitter"))
+                    cols[col_idx].append((bs_name, "top", "bottom", grid_row_pos, "beamsplitter"))
                 elif orientation == "top":
-                    rows[row_idx].append((bs_name, "top", "bottom", grid_col_pos))
-                    cols[col_idx].append((bs_name, "right", "left", grid_row_pos))
+                    rows[row_idx].append((bs_name, "top", "bottom", grid_col_pos, "beamsplitter"))
+                    cols[col_idx].append((bs_name, "right", "left", grid_row_pos, "beamsplitter"))
                 elif orientation == "right":
-                    rows[row_idx].append((bs_name, "right", "left", grid_col_pos))
-                    cols[col_idx].append((bs_name, "left", "right", grid_row_pos))
+                    rows[row_idx].append((bs_name, "right", "left", grid_col_pos, "beamsplitter"))
+                    cols[col_idx].append((bs_name, "left", "right", grid_row_pos, "beamsplitter"))
                 elif orientation == "bottom":
-                    rows[row_idx].append((bs_name, "bottom", "top", grid_col_pos))
-                    cols[col_idx].append((bs_name, "left", "right", grid_row_pos))
+                    rows[row_idx].append((bs_name, "bottom", "top", grid_col_pos, "beamsplitter"))
+                    cols[col_idx].append((bs_name, "left", "right", grid_row_pos, "beamsplitter"))
             
             # Process cell mirrors (4 mirrors per cell: left, top, right, bottom)
             mirror_names = [f"ml{row_idx + 1}{col_idx + 1}", f"mt{row_idx + 1}{col_idx + 1}", 
@@ -271,28 +233,30 @@ def sparse_uifo(
                     continue
                 
                 # Add cell mirror using helper function with default parameters
-                _add_mirror_element_default(S, cell_mirror_element, mirror_local_name)
+                _add_mirror(S, cell_mirror_element, mirror_local_name)
                 
                 # Calculate mirror position using default relative distance
-                mirror_rel_dist = default_mirror_relative_distance
+                mirror_rel_dist = mirror_relative_dist
                 
                 # Mirror 0 (left), Mirror 2 (right) go in rows
                 # Mirror 1 (top), Mirror 3 (bottom) go in columns
                 if mirror_idx == 0:  # Left mirror
                     mirror_position = grid_col_pos - mirror_rel_dist
-                    rows[row_idx].append((mirror_local_name, "right", "left", mirror_position))
+                    rows[row_idx].append((mirror_local_name, "right", "left", mirror_position, "mirror"))
                 elif mirror_idx == 1:  # Top mirror
                     mirror_position = grid_row_pos - mirror_rel_dist
-                    cols[col_idx].append((mirror_local_name, "right", "left", mirror_position))
+                    cols[col_idx].append((mirror_local_name, "right", "left", mirror_position, "mirror"))
                 elif mirror_idx == 2:  # Right mirror
                     mirror_position = grid_col_pos + mirror_rel_dist
-                    rows[row_idx].append((mirror_local_name, "right", "left", mirror_position))
+                    rows[row_idx].append((mirror_local_name, "right", "left", mirror_position, "mirror"))
                 elif mirror_idx == 3:  # Bottom mirror
                     mirror_position = grid_row_pos + mirror_rel_dist
-                    cols[col_idx].append((mirror_local_name, "right", "left", mirror_position))
+                    cols[col_idx].append((mirror_local_name, "right", "left", mirror_position, "mirror"))
     
     # Now connect elements within each row and column
     # Sort elements by position and connect them with spaces
+
+    boundary_types = ["detector", "laser", "squeezer"]
     
     for row_idx, row in enumerate(rows):
         if len(row) < 2:
@@ -303,19 +267,25 @@ def sparse_uifo(
         
         # Connect adjacent elements
         for i in range(len(row_sorted) - 1):
-            src_name, src_port_in, src_port_out, src_pos = row_sorted[i]
-            tgt_name, tgt_port_in, tgt_port_out, tgt_pos = row_sorted[i + 1]
-            
+            src_name, src_port_in, src_port_out, src_pos, src_type = row_sorted[i]
+            tgt_name, tgt_port_in, tgt_port_out, tgt_pos, tgt_type = row_sorted[i + 1]
+
+            if src_type in boundary_types:
+                _add_boundary_element(S, src_name, src_type, tgt_name, tgt_port_in, mode)
+            elif tgt_type in boundary_types:
+                _add_boundary_element(S, tgt_name, tgt_type, src_name, src_port_out, mode)
+
             # Calculate space length
             length = abs(tgt_pos - src_pos)
             
-            # Add space
-            S.space(src_name, tgt_name, length=length, 
-                   source_port=src_port_out, target_port=tgt_port_in)
-            
-            # Add signal for horizontal space (phase 0) - only for space_modulation mode
-            if mode == "space_modulation":
-                S.add("signal", f"s{src_name}{tgt_name}", target=f"{src_name}_{tgt_name}", phase=0)
+            # Add space if not a detector
+            if "detector" not in [src_type, tgt_type]:
+                S.space(src_name, tgt_name, length=length, 
+                    source_port=src_port_out, target_port=tgt_port_in)
+                
+                # Add signal for horizontal space (phase 0) - only for space_modulation mode
+                if mode == "space_modulation":
+                    S.add("signal", f"s{src_name}{tgt_name}", target=f"{src_name}_{tgt_name}", phase=0)
     
     for col_idx, col in enumerate(cols):
         if len(col) < 2:
@@ -326,19 +296,25 @@ def sparse_uifo(
         
         # Connect adjacent elements
         for i in range(len(col_sorted) - 1):
-            src_name, src_port_in, src_port_out, src_pos = col_sorted[i]
-            tgt_name, tgt_port_in, tgt_port_out, tgt_pos = col_sorted[i + 1]
+            src_name, src_port_in, src_port_out, src_pos, src_type = col_sorted[i]
+            tgt_name, tgt_port_in, tgt_port_out, tgt_pos, tgt_type = col_sorted[i + 1]
             
+            if src_type in boundary_types:
+                _add_boundary_element(S, src_name, src_type, tgt_name, tgt_port_in, mode)
+            elif tgt_type in boundary_types:
+                _add_boundary_element(S, tgt_name, tgt_type, src_name, src_port_out, mode)
+
             # Calculate space length
             length = abs(tgt_pos - src_pos)
             
-            # Add space
-            S.space(src_name, tgt_name, length=length,
-                   source_port=src_port_out, target_port=tgt_port_in)
-            
-            # Add signal for vertical space (phase 180) - only for space_modulation mode
-            if mode == "space_modulation":
-                S.add("signal", f"s{src_name}{tgt_name}", target=f"{src_name}_{tgt_name}", phase=180)
+            # Add space if not a detector
+            if "detector" not in [src_type, tgt_type]:
+                S.space(src_name, tgt_name, length=length,
+                       source_port=src_port_out, target_port=tgt_port_in)
+                
+                # Add signal for vertical space (phase 180) - only for space_modulation mode
+                if mode == "space_modulation":
+                    S.add("signal", f"s{src_name}{tgt_name}", target=f"{src_name}_{tgt_name}", phase=180)
     
     # Return the setup and parameters
     return S, S.parameters
@@ -702,7 +678,7 @@ def _map_nodes_to_element_positions(nodes_to_remove: set, n: int) -> list:
             if match:
                 x, y = int(match.group(1)), int(match.group(2))
                 # Find which boundary index this corresponds to
-                for boundary_idx, (side, pos_idx, bx, by, is_row, idx_in_row_col) in enumerate(boundary_info):
+                for boundary_idx, (side, row_or_col, bx, by, idx_in_row_col) in enumerate(boundary_info):
                     if bx == x and by == y:
                         positions.append(boundary_idx)
                         break
@@ -713,7 +689,7 @@ def _map_nodes_to_element_positions(nodes_to_remove: set, n: int) -> list:
             if match:
                 x, y = int(match.group(1)), int(match.group(2))
                 # Find which boundary index this corresponds to
-                for boundary_idx, (side, pos_idx, bx, by, is_row, idx_in_row_col) in enumerate(boundary_info):
+                for boundary_idx, (side, row_or_col, bx, by, idx_in_row_col) in enumerate(boundary_info):
                     if bx == x and by == y:
                         # Boundary mirror position starts after sources
                         positions.append(n * 4 + boundary_idx)
@@ -773,47 +749,26 @@ def _extract_elements(element_array: jnp.ndarray, n: int) -> dict:
     n_sources = n * 4
     n_boundary_mirrors = 4 * n
     n_cell_mirrors = 4 * n * n
-    n_beamsplitters = n * n
-    
-    # Separate elements into groups
-    source_elements = element_array[:n_sources]
-    boundary_mirrors = element_array[n_sources:n_sources + n_boundary_mirrors]
-    cell_mirrors = element_array[n_sources + n_boundary_mirrors:n_sources + n_boundary_mirrors + n_cell_mirrors].reshape(n, n, 4)
-    beamsplitters = element_array[n_sources + n_boundary_mirrors + n_cell_mirrors:n_sources + n_boundary_mirrors + n_cell_mirrors + n_beamsplitters].reshape(n, n)
+    # n_beamsplitters = n * n
+
+    split_sizes = jnp.cumsum(jnp.array([n_sources, n_boundary_mirrors, n_cell_mirrors]))
+
+    (
+        source_elements,
+        boundary_mirrors,
+        cell_mirrors,
+        beamsplitters
+    ) = jnp.split(element_array, split_sizes)
     
     return {
         'source_elements': source_elements,
         'boundary_mirrors': boundary_mirrors,
-        'cell_mirrors': cell_mirrors,
-        'beamsplitters': beamsplitters
+        'cell_mirrors': cell_mirrors.reshape(n, n, 4),
+        'beamsplitters': beamsplitters.reshape(n, n)
     }
 
 
-def _connect_source_to_mirror(S: Setup, source_type: str, source_name: str, mirror_name: str):
-    """
-    Connect a source (laser, squeezer, or detector) to a boundary mirror.
-    
-    Parameters
-    ----------
-    S : Setup
-        The setup object
-    source_type : str
-        Type of source: "detector", "laser", or "squeezer"
-    source_name : str
-        Name of the source element
-    mirror_name : str
-        Name of the mirror element
-    """
-    if source_type == "detector":
-        # Detectors are connected directly via target parameter
-        S.add("detector", f"{source_name}detector", target=mirror_name, port="left", direction="out")
-        S.add("qnoised", f"{source_name}noise", target=mirror_name, port="left", direction="out")
-    else:
-        # Lasers and squeezers are connected via space
-        S.space(source_name, mirror_name, length=1.0, target_port="left")
-
-
-def _prepare_boundary_info(n: int) -> list[tuple[str, int, int, int, bool, int]]:
+def _prepare_boundary_info(n: int) -> list[tuple[str, str, int, int, int]]:
     """
     Prepare boundary information for the UIFO.
     
@@ -824,75 +779,36 @@ def _prepare_boundary_info(n: int) -> list[tuple[str, int, int, int, bool, int]]
 
     Returns
     -------
-    list[tuple[str, int, int, int, bool, int]]
-        Boundary information: (side, pos, x, y, is_row, idx_in_row_col)
-        - side: side of the boundary (top, right, bottom, left)
-        - pos: position on the boundary (0 to n-1)
+    list[tuple[str, str, int, int, int]]
+        Boundary information: (side, row_or_col, x, y, idx_in_row_col)
+        - side: side of the boundary ("top", "right", "bottom", "left")
+        - row_or_col: "row" or "col"
         - x: x-coordinate of the boundary
         - y: y-coordinate of the boundary
-        - is_row: True if the boundary is a row, False if it is a column
         - idx_in_row_col: index in the row or column
     """
     boundary_info = []  # Store (side, pos, x, y, is_row, idx_in_row_col)
     
     # Top boundary (side 0): positions (0, 1) to (0, n) - these are columns
     for pos_idx in range(n):
-        boundary_info.append(("top", pos_idx, 0, pos_idx + 1, False, pos_idx))
+        boundary_info.append(("top", "col", 0, pos_idx + 1, pos_idx))
     
     # Right boundary (side 1): positions (1, n+1) to (n, n+1) - these are rows
     for pos_idx in range(n):
-        boundary_info.append(("right", pos_idx, pos_idx + 1, n + 1, True, pos_idx))
+        boundary_info.append(("right", "row", pos_idx + 1, n + 1, pos_idx))
     
     # Bottom boundary (side 2): positions (n+1, n) to (n+1, 1) - these are columns (reversed)
     for pos_idx in range(n):
-        boundary_info.append(("bottom", pos_idx, n + 1, n - pos_idx, False, n - pos_idx - 1))
+        boundary_info.append(("bottom", "col", n + 1, n - pos_idx, n - pos_idx - 1))
     
     # Left boundary (side 3): positions (n, 0) to (1, 0) - these are rows (reversed)
     for pos_idx in range(n):
-        boundary_info.append(("left", pos_idx, n - pos_idx, 0, True, n - pos_idx - 1))
+        boundary_info.append(("left", "row", n - pos_idx, 0, n - pos_idx - 1))
 
     return boundary_info
 
 
-def _add_source_element_default(S: Setup, source_element: int, source_name: str, 
-                                element_mapping: dict) -> str:
-    """
-    Add a source element (laser, squeezer, or detector) to the setup with default parameters.
-    
-    Parameters
-    ----------
-    S : Setup
-        The setup object
-    source_element : int
-        Element type ID
-    source_name : str
-        Name for the source
-    element_mapping : dict
-        Mapping from element IDs to element types
-        
-    Returns
-    -------
-    str or None
-        Type of source added (or None if no source)
-    """
-    source_type = element_mapping[int(source_element)]
-    
-    if source_type == "detector":
-        # Detector has no parameters
-        return "detector"
-    elif source_type == "laser":
-        # Use default laser parameters from DEFAULT_PROPERTIES
-        S.add("laser", source_name)
-        return "laser"
-    elif source_type == "squeezer":
-        # Use default squeezer parameters from DEFAULT_PROPERTIES
-        S.add("squeezer", source_name)
-        return "squeezer"
-    
-    return None
-
-
-def _add_mirror_element_default(S: Setup, mirror_element: int, mirror_name: str):
+def _add_mirror(S: Setup, mirror_element: int, mirror_name: str):
     """
     Add a mirror element to the setup with default parameters.
     
@@ -905,7 +821,6 @@ def _add_mirror_element_default(S: Setup, mirror_element: int, mirror_name: str)
     mirror_name : str
         Name for the mirror
     """
-    # Use default mirror parameters from DEFAULT_PROPERTIES
     S.add("mirror", mirror_name)
     
     # Add free mass if element type is 5 (mirror with free mass)
@@ -913,10 +828,46 @@ def _add_mirror_element_default(S: Setup, mirror_element: int, mirror_name: str)
         S.add("free_mass", f"{mirror_name}sus", target=mirror_name)
 
 
-def _add_beamsplitter_element_default(S: Setup, bs_element: int, bs_name: str,
+def _add_boundary_element(S: Setup, src_name: str, src_type: str, target_name: str, target_port: str, mode: str):
+    """
+    Add a boundary element (detector or laser/squeezer) to the setup.
+    
+    Parameters
+    ----------
+    S : Setup
+        The setup object
+    source_name : str
+        Name for the source
+    source_type : str
+        Type of source: "detector", "laser", or "squeezer"
+    target_name : str
+        Name of the target element
+    target_port : str
+        Port of the target element
+    mode : str
+        Modulation mode: 'space_modulation', 'amplitude_modulation', or 'frequency_modulation'.
+    """
+    if src_type == "detector":
+        # TODO: Ask why direction="out" instead of "in" for detectors?
+        S.add("detector", f"{src_name}detector", target=target_name, port=target_port, direction="out")
+        S.add("qnoised", f"{src_name}noise", target=target_name, port=target_port, direction="out")
+    else:
+        S.add(src_type, src_name)
+
+        # Add amplitude or frequency modulation signals for lasers
+        if src_type == "laser":
+            if mode == "amplitude_modulation":
+                S.add("signal", f"s{src_name}", target=f"{src_name}_amplitude", 
+                        amplitude=(f"{src_name}_power", jnp.sqrt))
+            elif mode == "frequency_modulation":
+                S.add("signal", f"s{src_name}", target=f"{src_name}_frequency")
+
+
+
+def _add_beamsplitter_element(S: Setup, bs_element: int, bs_name: str,
                                       element_mapping: dict, bs_orientation_mapping: dict) -> tuple:
     """
-    Add a beamsplitter element to the setup with default parameters.
+    Add a beamsplitter element to the setup.
     
     Parameters
     ----------

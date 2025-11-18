@@ -358,12 +358,12 @@ def plot_uifo_setup(setup, output_file=None, title="UIFO Setup"):
             x1, y1 = node_positions[target]
             
             # Add edge coordinates (with None to create separate line segments)
-            edge_x.extend([x0, x1, None])
-            edge_y.extend([y0, y1, None])
+            edge_y.extend([x0, x1, None])
+            edge_x.extend([y0, y1, None])
             
             # Calculate midpoint for hover interaction
-            mid_x = (x0 + x1) / 2
-            mid_y = (y0 + y1) / 2
+            mid_x = (y0 + y1) / 2
+            mid_y = (x0 + x1) / 2
             edge_midpoints_x.append(mid_x)
             edge_midpoints_y.append(mid_y)
             
@@ -434,8 +434,8 @@ def plot_uifo_setup(setup, output_file=None, title="UIFO Setup"):
     
     # Add nodes by component type
     for comp_type, nodes in component_types.items():
-        x_coords = [n['x'] for n in nodes]
-        y_coords = [n['y'] for n in nodes]
+        y_coords = [n['x'] for n in nodes]
+        x_coords = [n['y'] for n in nodes]
         names = [n['name'] for n in nodes]
         color = nodes[0]['color']
         symbol = nodes[0]['symbol']
@@ -533,13 +533,13 @@ def plot_uifo_setup(setup, output_file=None, title="UIFO Setup"):
     fig.update_layout(
         title=title,
         xaxis=dict(
-            title="X Coordinate",
+            title="Horizontal",
             showgrid=True,
             zeroline=True,
             gridcolor='lightgray',
         ),
         yaxis=dict(
-            title="Y Coordinate",
+            title="Vertical",
             showgrid=True,
             zeroline=True,
             gridcolor='lightgray',
@@ -552,6 +552,8 @@ def plot_uifo_setup(setup, output_file=None, title="UIFO Setup"):
         width=1000,
         height=1000,
     )
+
+    fig.update_yaxes(autorange="reversed")
     
     # Save or show
     if output_file:
