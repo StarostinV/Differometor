@@ -189,6 +189,167 @@ def get_active_parameters_mask(element_array: jnp.ndarray, sparse_setup: dict, n
     return mask
 
 
+def get_physical_parameter_index_map(element_array: jnp.ndarray, n: int) -> dict[tuple[str, str], int]:
+    """
+    Generate a mapping from (element_name, property_name) to parameter index.
+    
+    This function accounts for the actual element types in the element_array, so it correctly
+    maps laser properties (power, phase) vs squeezer properties (db, angle), and includes
+    only parameters for elements that actually exist.
+    
+    Parameters
+    ----------
+    element_array : jnp.ndarray
+        The element array. Shape: (N_elements,) where N_elements = n * (8 + 5*n).
+    n : int
+        Grid size (n x n grid)
+        
+    Returns
+    -------
+    dict[tuple[str, str], int]
+        Dictionary mapping (element_name, property_name) to parameter array index.
+        Only includes physical parameters, not positional encoding parameters.
+        For elements with free mass, the element name has "sus" appended for the mass property.
+        
+    Examples
+    --------
+    >>> element_array = jnp.array([2, 0, ...])  # Laser at boundary01
+    >>> param_map = get_physical_parameter_index_map(element_array, n=2)
+    >>> param_map[("boundary01", "power")]
+    0
+    >>> param_map[("boundary01", "phase")]
+    1
+    """
+    param_map = {}
+    
+    # Helper function to generate boundary coordinate ordering (clockwise from top-left)
+    def get_boundary_coords(n: int) -> list[tuple[int, int]]:
+        """Returns list of (x, y) coordinates for boundary elements in clockwise order."""
+        coords = []
+        # Top boundary: x=0, y=1..n
+        for y in range(1, n + 1):
+            coords.append((0, y))
+        # Right boundary: x=1..n, y=n+1
+        for x in range(1, n + 1):
+            coords.append((x, n + 1))
+        # Bottom boundary: x=n+1, y=n..1 (reversed)
+        for y in range(n, 0, -1):
+            coords.append((n + 1, y))
+        # Left boundary: x=n..1 (reversed), y=0
+        for x in range(n, 0, -1):
+            coords.append((x, 0))
+        return coords
+    
+    # Extract element subsets from the flat element_array
+    n_boundary_sources = 4 * n
+    n_boundary_mirrors = 4 * n
+    n_cell_mirrors = 4 * n * n
+    n_cell_beamsplitters = n * n
+    
+    boundary_sources = element_array[:n_boundary_sources]
+    boundary_mirrors = element_array[n_boundary_sources:n_boundary_sources + n_boundary_mirrors]
+    cell_mirrors = element_array[n_boundary_sources + n_boundary_mirrors:n_boundary_sources + n_boundary_mirrors + n_cell_mirrors]
+    cell_beamsplitters = element_array[n_boundary_sources + n_boundary_mirrors + n_cell_mirrors:]
+    
+    boundary_coords = get_boundary_coords(n)
+    param_idx = 0
+    
+    # 1. BOUNDARY SOURCE PARAMETERS (2 params per source × 4n sources)
+    for i, (x, y) in enumerate(boundary_coords):
+        element_type = int(boundary_sources[i])
+        element_name = f"boundary{x}{y}"
+        
+        # Determine parameter names based on element type
+        if element_type == 1:  # Detector - no parameters
+            pass
+        elif element_type == 2:  # Laser
+            param_map[(element_name, "power")] = param_idx
+            param_map[(element_name, "phase")] = param_idx + 1
+        elif element_type == 3:  # Squeezer
+            param_map[(element_name, "db")] = param_idx
+            param_map[(element_name, "angle")] = param_idx + 1
+        
+        # Always advance by 2 slots per source
+        param_idx += 2
+    
+    # 2. BOUNDARY MIRROR PARAMETERS (4 params per mirror × 4n mirrors)
+    mirror_params = ['loss', 'reflectivity', 'tuning', 'mass']
+    
+    for i, (x, y) in enumerate(boundary_coords):
+        element_type = int(boundary_mirrors[i])
+        element_name = f"m{x}{y}"
+        
+        if element_type == 4:  # Mirror (no free mass)
+            for param in mirror_params[:3]:  # loss, reflectivity, tuning
+                param_map[(element_name, param)] = param_idx
+                param_idx += 1
+            param_idx += 1  # Skip mass slot
+        elif element_type == 5:  # Mirror with free mass
+            for param in mirror_params[:3]:
+                param_map[(element_name, param)] = param_idx
+                param_idx += 1
+            # Mass parameter with "sus" suffix
+            param_map[(element_name + "sus", "mass")] = param_idx
+            param_idx += 1
+        else:  # No element
+            param_idx += 4
+    
+    # 3. CELL MIRROR PARAMETERS (4 params per mirror × 4n² mirrors)
+    mirror_directions = ['l', 't', 'r', 'b']
+    cell_mirror_idx = 0
+    
+    for row in range(1, n + 1):
+        for col in range(1, n + 1):
+            for direction in mirror_directions:
+                element_type = int(cell_mirrors[cell_mirror_idx])
+                element_name = f"m{direction}{row}{col}"
+                
+                if element_type == 4:  # Mirror (no free mass)
+                    for param in mirror_params[:3]:
+                        param_map[(element_name, param)] = param_idx
+                        param_idx += 1
+                    param_idx += 1  # Skip mass slot
+                elif element_type == 5:  # Mirror with free mass
+                    for param in mirror_params[:3]:
+                        param_map[(element_name, param)] = param_idx
+                        param_idx += 1
+                    param_map[(element_name + "sus", "mass")] = param_idx
+                    param_idx += 1
+                else:  # No element
+                    param_idx += 4
+                
+                cell_mirror_idx += 1
+    
+    # 4. CELL BEAMSPLITTER PARAMETERS (5 params per beamsplitter × n² beamsplitters)
+    beamsplitter_params = ['loss', 'reflectivity', 'tuning', 'alpha', 'mass']
+    bs_idx = 0
+    
+    for row in range(1, n + 1):
+        for col in range(1, n + 1):
+            element_type = int(cell_beamsplitters[bs_idx])
+            element_name = f"center{row}{col}"
+            
+            # Regular beamsplitters: 6-9
+            # Directional beamsplitters: 10-17 (no parameters)
+            if element_type in [6, 7]:  # Beamsplitter without mass
+                for param in beamsplitter_params[:4]:  # loss, reflectivity, tuning, alpha
+                    param_map[(element_name, param)] = param_idx
+                    param_idx += 1
+                param_idx += 1  # Skip mass slot
+            elif element_type in [8, 9]:  # Beamsplitter with mass
+                for param in beamsplitter_params[:4]:
+                    param_map[(element_name, param)] = param_idx
+                    param_idx += 1
+                param_map[(element_name + "sus", "mass")] = param_idx
+                param_idx += 1
+            else:  # No element or directional beamsplitter
+                param_idx += 5
+            
+            bs_idx += 1
+    
+    return param_map
+
+
 def get_sparse_parameter_bounds(element_array: jnp.ndarray, sparse_setup: dict, n: int):
     """
     Generate the bounds of the sparse parameters for a given element array and sparse setup.
