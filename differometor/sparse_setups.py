@@ -1,4 +1,9 @@
+"""
+Module for building sparse quasi-universal interferometer (sparse UIFO) setups from element arrays.
+"""
+
 import jax.numpy as jnp
+
 from differometor.setups import Setup
 
 
@@ -270,6 +275,8 @@ def sparse_uifo(
             src_name, src_port_in, src_port_out, src_pos, src_type = row_sorted[i]
             tgt_name, tgt_port_in, tgt_port_out, tgt_pos, tgt_type = row_sorted[i + 1]
 
+            # TODO: make sure we don't have a situation where both src and tgt are boundary elements.
+
             if src_type in boundary_types:
                 _add_boundary_element(S, src_name, src_type, tgt_name, tgt_port_in, mode)
             elif tgt_type in boundary_types:
@@ -280,6 +287,11 @@ def sparse_uifo(
             
             # Add space if not a detector
             if "detector" not in [src_type, tgt_type]:
+                if tgt_type in ['laser', 'squeezer']:
+                    # Swap source and target: lasers and squeezers can only be sources of edges.
+                    src_name, tgt_name = tgt_name, src_name
+                    src_port_out, tgt_port_in = tgt_port_in, src_port_out
+                    
                 S.space(src_name, tgt_name, length=length, 
                     source_port=src_port_out, target_port=tgt_port_in)
                 
@@ -309,6 +321,11 @@ def sparse_uifo(
             
             # Add space if not a detector
             if "detector" not in [src_type, tgt_type]:
+                if tgt_type in ['laser', 'squeezer']:
+                    # Swap source and target: lasers and squeezers can only be sources of edges.
+                    src_name, tgt_name = tgt_name, src_name
+                    src_port_out, tgt_port_in = tgt_port_in, src_port_out
+
                 S.space(src_name, tgt_name, length=length,
                        source_port=src_port_out, target_port=tgt_port_in)
                 
