@@ -18,7 +18,33 @@ dependencies = ["jax==0.5.0", "optax==0.2.4", "numpy", "matplotlib", "tqdm"]
 Homepage = "https://github.com/artificial-scientist-lab/Differometor"
 Issues = "https://github.com/artificial-scientist-lab/Differometor/issues"
 
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["differometor*"]
 exclude = ["examples", "images"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+# Output options
+addopts = [
+    "-v",                    # Verbose output
+    "--tb=short",           # Shorter traceback format
+    "--color=yes",          # Colored output
+    "-ra",                  # Show summary of all test outcomes
+]
+
+# Ignore warnings
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+# Minimum Python version for tests
+minversion = "6.0"
